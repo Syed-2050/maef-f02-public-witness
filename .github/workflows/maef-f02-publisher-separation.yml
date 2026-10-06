@@ -136,7 +136,8 @@ jobs:
           docker start -a "$worker_cid" > evidence/worker-stdout.txt 2> evidence/worker-stderr.txt
           test "$(docker inspect -f '{{.State.ExitCode}}' "$worker_cid")" = "0"
 
-          docker run --rm             --network none --cap-drop ALL --security-opt no-new-privileges:true             --read-only --mount type=volume,src=maef-spool,dst=/spool,readonly             --mount type=bind,src="$PWD/worker-out",dst=/hostout             python:3.13-alpine sh -c 'cp /spool/manifest.json /hostout/manifest.json && cp /spool/patch.bin /hostout/patch.bin'
+          # Host-controlled post-worker evidence extraction; outside measured worker.
+          docker run --rm             --network none             --read-only --mount type=volume,src=maef-spool,dst=/spool,readonly             --mount type=bind,src="$PWD/worker-out",dst=/hostout             python:3.13-alpine sh -c 'cp /spool/manifest.json /hostout/manifest.json && cp /spool/patch.bin /hostout/patch.bin'
 
           manifest_sha="$(sha256sum worker-out/manifest.json | awk '{print $1}')"
           patch_sha="$(sha256sum worker-out/patch.bin | awk '{print $1}')"
@@ -172,8 +173,9 @@ jobs:
 
           docker start -a "$publisher_cid" > evidence/publisher-stdout.txt 2> evidence/publisher-stderr.txt
           test "$(docker inspect -f '{{.State.ExitCode}}' "$publisher_cid")" = "0"
+          # Host-controlled post-publisher receipt extraction; outside measured publisher.
           docker run --rm \
-            --network none --cap-drop ALL --security-opt no-new-privileges:true \
+            --network none \
             --read-only --mount type=volume,src=maef-publisher-out,dst=/publisher-out,readonly \
             --mount type=bind,src="$PWD/evidence",dst=/hostout \
             python:3.13-alpine sh -c 'cp /publisher-out/publisher-receipt.json /hostout/publisher-receipt.json'
