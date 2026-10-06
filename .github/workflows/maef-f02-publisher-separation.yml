@@ -1,0 +1,208 @@
+name: MAEF F02 Publisher Runtime Separation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/maef-f02-publisher-separation.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maef-f02-publisher-separation
+  cancel-in-progress: false
+
+jobs:
+  separation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Execute synthetic worker-publisher separation witness
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence worker-out
+
+          candidate_sha="790e330cee287a4e31a36dfda496068f68db8dc8"
+          candidate_tree="9134cc9f0b78f058a419a058ecb92f4d2cc49919"
+          publisher_secret="MAEF_SYNTH_PUBLISHER_$(openssl rand -hex 32)"
+          publisher_secret_sha="$(printf '%s' "$publisher_secret" | sha256sum | awk '{print $1}')"
+          challenge="$(openssl rand -hex 32)"
+
+          printf '%s\n' "$candidate_sha" > evidence/candidate-sha.txt
+          printf '%s\n' "$candidate_tree" > evidence/candidate-tree.txt
+          printf '%s\n' "$publisher_secret_sha" > evidence/publisher-secret-sha256.txt
+          printf '%s\n' "$challenge" > evidence/challenge.txt
+          printf '%s\n' "${GITHUB_SHA}" > evidence/witness-commit.txt
+
+          docker pull python:3.13-alpine
+          docker volume create maef-spool >/dev/null
+
+          cat > worker.py <<'PY'
+          import os,json,hashlib,pathlib
+          out=pathlib.Path("/out")
+          out.mkdir(parents=True,exist_ok=True)
+          candidate_sha=os.environ["CANDIDATE_SHA"]
+          candidate_tree=os.environ["CANDIDATE_TREE"]
+          challenge=os.environ["CHALLENGE"]
+          forbidden=[k for k in os.environ if "PUBLISHER" in k.upper() or "TOKEN" in k.upper() or "SECRET" in k.upper()]
+          patch=b"MAEF F02 synthetic immutable publisher-spool payload\n"
+          (out/"patch.bin").write_bytes(patch)
+          manifest={
+            "schema":"MAEF_F02_SYNTHETIC_WORKER_SPOOL_V1",
+            "candidateSha":candidate_sha,
+            "candidateTree":candidate_tree,
+            "challenge":challenge,
+            "patchSha256":hashlib.sha256(patch).hexdigest(),
+            "publisherCredentialVisible":False,
+            "forbiddenEnvironmentKeys":forbidden,
+            "publisherIpcVisible":False,
+            "dockerSocketPresent":pathlib.Path("/var/run/docker.sock").exists(),
+          }
+          (out/"manifest.json").write_text(json.dumps(manifest,sort_keys=True,separators=(",",":")),encoding="utf-8")
+          if forbidden or manifest["dockerSocketPresent"]:
+            raise SystemExit(17)
+          PY
+
+          cat > publisher.py <<'PY'
+          import os,json,hashlib,pathlib,sys
+          spool=pathlib.Path("/spool")
+          out=pathlib.Path("/publisher-out")
+          secret=os.environ.get("PUBLISHER_SECRET","")
+          expected_secret_sha=os.environ["PUBLISHER_SECRET_SHA256"]
+          expected_manifest_sha=os.environ["MANIFEST_SHA256"]
+          expected_patch_sha=os.environ["PATCH_SHA256"]
+          if not secret: raise SystemExit("publisher secret missing")
+          if hashlib.sha256(secret.encode()).hexdigest()!=expected_secret_sha: raise SystemExit("publisher secret digest mismatch")
+          manifest_bytes=(spool/"manifest.json").read_bytes()
+          patch_bytes=(spool/"patch.bin").read_bytes()
+          if hashlib.sha256(manifest_bytes).hexdigest()!=expected_manifest_sha: raise SystemExit("manifest digest mismatch")
+          if hashlib.sha256(patch_bytes).hexdigest()!=expected_patch_sha: raise SystemExit("patch digest mismatch")
+          manifest=json.loads(manifest_bytes)
+          if manifest["publisherCredentialVisible"] or manifest["forbiddenEnvironmentKeys"] or manifest["publisherIpcVisible"] or manifest["dockerSocketPresent"]:
+              raise SystemExit("worker boundary claim failed")
+          write_blocked=False
+          try:
+              (spool/"publisher-must-not-write.txt").write_text("forbidden",encoding="utf-8")
+          except OSError:
+              write_blocked=True
+          if not write_blocked: raise SystemExit("read-only spool unexpectedly writable")
+          receipt={
+            "schema":"MAEF_F02_SYNTHETIC_PUBLISHER_RECEIPT_V1",
+            "candidateSha":manifest["candidateSha"],
+            "candidateTree":manifest["candidateTree"],
+            "challenge":manifest["challenge"],
+            "publisherSecretSha256":expected_secret_sha,
+            "publisherSecretRecorded":False,
+            "manifestSha256":expected_manifest_sha,
+            "patchSha256":expected_patch_sha,
+            "spoolReadOnlyWriteBlocked":True,
+            "publisherNetworkModeExpected":"none"
+          }
+          out.mkdir(parents=True,exist_ok=True)
+          (out/"publisher-receipt.json").write_text(json.dumps(receipt,sort_keys=True,separators=(",",":")),encoding="utf-8")
+          PY
+
+          worker_cid="$(docker create             --name maef-f02-synth-worker             --network none             --cap-drop ALL             --security-opt no-new-privileges:true             --user 65532:65532             --read-only             --tmpfs /tmp:rw,nosuid,nodev,noexec,size=8m,mode=1777             --mount type=volume,src=maef-spool,dst=/out             --entrypoint /usr/bin/env             python:3.13-alpine             -i PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8             CANDIDATE_SHA="$candidate_sha" CANDIDATE_TREE="$candidate_tree" CHALLENGE="$challenge"             /usr/local/bin/python3 -c "$(cat worker.py)")"
+
+          docker inspect "$worker_cid" > evidence/worker-container-inspect.json
+          jq -e '
+            .[0].HostConfig.NetworkMode=="none" and
+            (.[0].HostConfig.CapDrop|index("ALL")!=null) and
+            (.[0].HostConfig.SecurityOpt|index("no-new-privileges:true")!=null) and
+            .[0].HostConfig.ReadonlyRootfs==true and
+            .[0].HostConfig.Privileged==false and
+            .[0].Config.User=="65532:65532" and
+            ((.[0].Config.Env|map(select(test("PUBLISHER|TOKEN|SECRET";"i"))))|length==0) and
+            ((.[0].HostConfig.Binds // [])|length==0) and
+            ((.[0].HostConfig.Devices // [])|length==0) and
+            (.[0].HostConfig.PidMode=="")
+          ' evidence/worker-container-inspect.json >/dev/null
+
+          docker start -a "$worker_cid" > evidence/worker-stdout.txt 2> evidence/worker-stderr.txt
+          test "$(docker inspect -f '{{.State.ExitCode}}' "$worker_cid")" = "0"
+
+          docker run --rm             --network none --cap-drop ALL --security-opt no-new-privileges:true             --read-only --mount type=volume,src=maef-spool,dst=/spool,readonly             --mount type=bind,src="$PWD/worker-out",dst=/hostout             python:3.13-alpine sh -c 'cp /spool/manifest.json /hostout/manifest.json && cp /spool/patch.bin /hostout/patch.bin'
+
+          manifest_sha="$(sha256sum worker-out/manifest.json | awk '{print $1}')"
+          patch_sha="$(sha256sum worker-out/patch.bin | awk '{print $1}')"
+          cp worker-out/manifest.json evidence/worker-manifest.json
+          cp worker-out/patch.bin evidence/worker-patch.bin
+
+          if grep -aFq "$publisher_secret" evidence/worker-manifest.json evidence/worker-patch.bin evidence/worker-stdout.txt evidence/worker-stderr.txt; then
+            echo "synthetic publisher secret crossed into worker evidence" >&2
+            exit 1
+          fi
+
+          mkdir -p publisher-out
+          publisher_cid="$(docker create             --name maef-f02-synth-publisher             --network none             --cap-drop ALL             --security-opt no-new-privileges:true             --user 65531:65531             --read-only             --tmpfs /tmp:rw,nosuid,nodev,noexec,size=8m,mode=1777             --mount type=volume,src=maef-spool,dst=/spool,readonly             --mount type=bind,src="$PWD/publisher-out",dst=/publisher-out             --entrypoint /usr/bin/env             python:3.13-alpine             -i PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8             PUBLISHER_SECRET="$publisher_secret"             PUBLISHER_SECRET_SHA256="$publisher_secret_sha"             MANIFEST_SHA256="$manifest_sha" PATCH_SHA256="$patch_sha"             /usr/local/bin/python3 -c "$(cat publisher.py)")"
+
+          docker inspect "$publisher_cid" > evidence/publisher-container-inspect.json
+
+          # Never persist the raw secret from docker inspect: sanitize before artifact creation.
+          jq '.[0].Config.Env |= map(if startswith("PUBLISHER_SECRET=") then "PUBLISHER_SECRET=<REDACTED>" else . end)'             evidence/publisher-container-inspect.json > evidence/publisher-container-inspect.sanitized.json
+          rm evidence/publisher-container-inspect.json
+
+          jq -e '
+            .[0].HostConfig.NetworkMode=="none" and
+            (.[0].HostConfig.CapDrop|index("ALL")!=null) and
+            (.[0].HostConfig.SecurityOpt|index("no-new-privileges:true")!=null) and
+            .[0].HostConfig.ReadonlyRootfs==true and
+            .[0].HostConfig.Privileged==false and
+            .[0].Config.User=="65531:65531" and
+            ((.[0].HostConfig.Devices // [])|length==0) and
+            (.[0].HostConfig.PidMode=="") and
+            ((.[0].Mounts|map(select(.Destination=="/spool" and .RW==false)))|length==1)
+          ' evidence/publisher-container-inspect.sanitized.json >/dev/null
+
+          docker start -a "$publisher_cid" > evidence/publisher-stdout.txt 2> evidence/publisher-stderr.txt
+          test "$(docker inspect -f '{{.State.ExitCode}}' "$publisher_cid")" = "0"
+          cp publisher-out/publisher-receipt.json evidence/publisher-receipt.json
+
+          if grep -aFq "$publisher_secret" evidence/*; then
+            echo "raw synthetic publisher secret leaked into sanitized evidence" >&2
+            exit 1
+          fi
+
+          jq -n             --arg candidateSha "$candidate_sha"             --arg candidateTree "$candidate_tree"             --arg witnessCommit "${GITHUB_SHA}"             --arg challenge "$challenge"             --arg secretSha "$publisher_secret_sha"             --arg manifestSha "$manifest_sha"             --arg patchSha "$patch_sha"             '{
+              schema:"MAEF_F02_PUBLISHER_RUNTIME_SEPARATION_V1",
+              candidateSha:$candidateSha,
+              candidateTree:$candidateTree,
+              witnessCommit:$witnessCommit,
+              challenge:$challenge,
+              syntheticPublisherSecretSha256:$secretSha,
+              workerSawPublisherCredential:false,
+              workerPublisherIpcVisible:false,
+              workerDockerSocketVisible:false,
+              workerNetworkMode:"none",
+              publisherNetworkMode:"none",
+              contentAddressedSpool:{manifestSha256:$manifestSha,patchSha256:$patchSha,publisherMountReadOnly:true},
+              realPublisherCredentialProvisioned:false,
+              realPublisherActivated:false,
+              repositoryMutationPerformed:false,
+              separationWitnessPass:true
+            }' > evidence/separation-summary.json
+
+          rm -f evidence/SHA256SUMS
+          find evidence -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS
+
+          docker rm "$worker_cid" "$publisher_cid" >/dev/null
+          docker volume rm maef-spool >/dev/null
+          unset publisher_secret
+
+      - name: Print sanitized separation summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f evidence/separation-summary.json ]; then cat evidence/separation-summary.json; fi
+          if [ -f evidence/SHA256SUMS ]; then cat evidence/SHA256SUMS; fi
+
+      - name: Upload sanitized separation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: maef-f02-publisher-runtime-separation
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 7
