@@ -111,9 +111,66 @@ jobs:
               f02OverallQualified:false
             }' > evidence/host-summary.json
 
+          docker rm "$cid" >/dev/null
+
+      - name: Execute actual denied write against inert public target
+        id: denial
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          sentinel=".maef-f02-denied-probe/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.txt"
+          pre_ref="$(curl --proto '=https' --tlsv1.2 -fsS             -H "Accept: application/vnd.github+json"             -H "Authorization: Bearer $GH_TOKEN"             "${api}/git/ref/heads/main" | jq -r '.object.sha')"
+          test -n "$pre_ref" && test "$pre_ref" != "null"
+
+          payload="$(jq -cn             --arg msg "MAEF F02 expected-denied inert sentinel ${GITHUB_RUN_ID}"             --arg content "$(printf '%s' "THIS_WRITE_MUST_BE_DENIED_${GITHUB_RUN_ID}" | base64 -w0)"             '{message:$msg,content:$content,branch:"main"}')"
+
+          set +e
+          http_status="$(curl --proto '=https' --tlsv1.2 -sS             -o evidence/denied-write-response.json             -w '%{http_code}'             -X PUT             -H "Accept: application/vnd.github+json"             -H "Authorization: Bearer $GH_TOKEN"             -H "X-GitHub-Api-Version: 2022-11-28"             "${api}/contents/${sentinel}"             -d "$payload")"
+          curl_rc=$?
+          set -e
+          printf '%s\n' "$http_status" > evidence/denied-write-http-status.txt
+          printf '%s\n' "$curl_rc" > evidence/denied-write-curl-exit.txt
+
+          post_ref="$(curl --proto '=https' --tlsv1.2 -fsS             -H "Accept: application/vnd.github+json"             -H "Authorization: Bearer $GH_TOKEN"             "${api}/git/ref/heads/main" | jq -r '.object.sha')"
+
+          set +e
+          sentinel_status="$(curl --proto '=https' --tlsv1.2 -sS             -o evidence/denied-write-sentinel-read.json             -w '%{http_code}'             -H "Accept: application/vnd.github+json"             -H "Authorization: Bearer $GH_TOKEN"             "${api}/contents/${sentinel}?ref=main")"
+          sentinel_read_rc=$?
+          set -e
+
+          jq -n             --arg identity "GITHUB_ACTIONS_TOKEN_CONTENTS_READ_ONLY"             --arg repository "${GITHUB_REPOSITORY}"             --arg branch "main"             --arg path "$sentinel"             --arg method "PUT"             --arg expected "DENIED"             --arg httpStatus "$http_status"             --arg preRef "$pre_ref"             --arg postRef "$post_ref"             --arg sentinelReadStatus "$sentinel_status"             --arg curlExit "$curl_rc"             --arg sentinelReadCurlExit "$sentinel_read_rc"             '{
+              schema:"MAEF_F02_INERT_DENIED_WRITE_V1",
+              identity:$identity,
+              target:{repository:$repository,branch:$branch,path:$path,method:$method},
+              intent:$expected,
+              httpStatus:($httpStatus|tonumber),
+              preRef:$preRef,
+              postRef:$postRef,
+              sentinelReadStatus:($sentinelReadStatus|tonumber),
+              curlExit:($curlExit|tonumber),
+              sentinelReadCurlExit:($sentinelReadCurlExit|tonumber),
+              writeSucceeded:false,
+              exactRefsUnchanged:($preRef==$postRef),
+              inertNonproductionWriteDenialProven:
+                (($httpStatus|tonumber)==403 and $preRef==$postRef and ($sentinelReadStatus|tonumber)==404)
+            }' > evidence/denied-write-summary.json
+
+          if [ "$curl_rc" -ne 0 ] || [ "$http_status" != "403" ] || [ "$pre_ref" != "$post_ref" ] || [ "$sentinel_status" != "404" ]; then
+            echo "Denied-write gate FAILED; preserving evidence and stopping." >&2
+            cat evidence/denied-write-summary.json >&2
+            exit 1
+          fi
+
+          jq '.liveWriteDenialProven=true |
+              .liveWriteDenialScope="INERT_PUBLIC_WITNESS_REPO__READ_ONLY_ACTIONS_IDENTITY__NOT_CANONICAL"'
+            evidence/host-summary.json > evidence/host-summary.tmp
+          mv evidence/host-summary.tmp evidence/host-summary.json
+
           rm -f evidence/SHA256SUMS
           find evidence -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS
-          docker rm "$cid" >/dev/null
 
       - name: Print witness summary
         if: always()
@@ -124,6 +181,8 @@ jobs:
           if [ -f evidence/host-summary.json ]; then cat evidence/host-summary.json; fi
           echo "=== WORKER SELF CHECK ==="
           if [ -f evidence/worker-observation.json ]; then jq '.selfCheck' evidence/worker-observation.json || true; fi
+          echo "=== DENIED WRITE ==="
+          if [ -f evidence/denied-write-summary.json ]; then cat evidence/denied-write-summary.json; fi
           echo "=== EVIDENCE HASHES ==="
           if [ -f evidence/SHA256SUMS ]; then cat evidence/SHA256SUMS; fi
 
