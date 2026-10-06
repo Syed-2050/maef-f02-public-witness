@@ -39,14 +39,18 @@ jobs:
           docker pull python:3.13-alpine
           docker volume create maef-spool >/dev/null
           docker volume create maef-publisher-out >/dev/null
+          docker volume create maef-publisher-secret >/dev/null
 
-          # Host-controlled setup only: initialize ownership before measured containers run.
-          docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges:true \
+          # Host-controlled setup only; outside measured worker/publisher processes.
+          docker run --rm --network none \
             --mount type=volume,src=maef-spool,dst=/init \
             python:3.13-alpine sh -c 'chown 65532:65532 /init && chmod 0700 /init'
-          docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges:true \
+          docker run --rm --network none \
             --mount type=volume,src=maef-publisher-out,dst=/init \
             python:3.13-alpine sh -c 'chown 65531:65531 /init && chmod 0700 /init'
+          printf '%s' "$publisher_secret" | docker run -i --rm --network none \
+            --mount type=volume,src=maef-publisher-secret,dst=/secret \
+            python:3.13-alpine sh -c 'cat >/secret/value && chmod 0400 /secret/value'
 
           cat > worker.py <<'PY'
           import os,json,hashlib,pathlib
@@ -78,7 +82,7 @@ jobs:
           import os,json,hashlib,pathlib,sys
           spool=pathlib.Path("/spool")
           out=pathlib.Path("/publisher-out")
-          secret=os.environ.get("PUBLISHER_SECRET","")
+          secret=pathlib.Path("/secret/value").read_text(encoding="utf-8")
           expected_secret_sha=os.environ["PUBLISHER_SECRET_SHA256"]
           expected_manifest_sha=os.environ["MANIFEST_SHA256"]
           expected_patch_sha=os.environ["PATCH_SHA256"]
@@ -144,13 +148,11 @@ jobs:
             exit 1
           fi
 
-          mkdir -p publisher-out
-          publisher_cid="$(docker create             --name maef-f02-synth-publisher             --network none             --cap-drop ALL             --security-opt no-new-privileges:true             --user 65531:65531             --read-only             --tmpfs /tmp:rw,nosuid,nodev,noexec,size=8m,mode=1777             --mount type=volume,src=maef-spool,dst=/spool,readonly             --mount type=bind,src="$PWD/publisher-out",dst=/publisher-out             --entrypoint /usr/bin/env             python:3.13-alpine             -i PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8             PUBLISHER_SECRET="$publisher_secret"             PUBLISHER_SECRET_SHA256="$publisher_secret_sha"             MANIFEST_SHA256="$manifest_sha" PATCH_SHA256="$patch_sha"             /usr/local/bin/python3 -c "$(cat publisher.py)")"
+          publisher_cid="$(docker create             --name maef-f02-synth-publisher             --network none             --cap-drop ALL             --security-opt no-new-privileges:true             --user 65531:65531             --read-only             --tmpfs /tmp:rw,nosuid,nodev,noexec,size=8m,mode=1777             --mount type=volume,src=maef-spool,dst=/spool,readonly             --mount type=volume,src=maef-publisher-out,dst=/publisher-out             --mount type=volume,src=maef-publisher-secret,dst=/secret,readonly             --entrypoint /usr/bin/env             python:3.13-alpine             -i PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8             PUBLISHER_SECRET_SHA256="$publisher_secret_sha"             MANIFEST_SHA256="$manifest_sha" PATCH_SHA256="$patch_sha"             /usr/local/bin/python3 -c "$(cat publisher.py)")"
 
           docker inspect "$publisher_cid" > evidence/publisher-container-inspect.json
 
-          # Never persist the raw secret from docker inspect: sanitize before artifact creation.
-          jq '.[0].Config.Env |= map(if startswith("PUBLISHER_SECRET=") then "PUBLISHER_SECRET=<REDACTED>" else . end)'             evidence/publisher-container-inspect.json > evidence/publisher-container-inspect.sanitized.json
+          cp evidence/publisher-container-inspect.json evidence/publisher-container-inspect.sanitized.json
           rm evidence/publisher-container-inspect.json
 
           jq -e '
@@ -162,7 +164,10 @@ jobs:
             .[0].Config.User=="65531:65531" and
             ((.[0].HostConfig.Devices // [])|length==0) and
             (.[0].HostConfig.PidMode=="") and
-            ((.[0].Mounts|map(select(.Destination=="/spool" and .RW==false)))|length==1)
+            ((.[0].Config.Env|map(select(startswith("PUBLISHER_SECRET="))))|length==0) and
+            ((.[0].Mounts|map(select(.Destination=="/spool" and .RW==false)))|length==1) and
+            ((.[0].Mounts|map(select(.Destination=="/secret" and .RW==false)))|length==1) and
+            ((.[0].Mounts|map(select(.Destination=="/publisher-out" and .RW==true)))|length==1)
           ' evidence/publisher-container-inspect.sanitized.json >/dev/null
 
           docker start -a "$publisher_cid" > evidence/publisher-stdout.txt 2> evidence/publisher-stderr.txt
@@ -201,7 +206,7 @@ jobs:
           find evidence -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS
 
           docker rm "$worker_cid" "$publisher_cid" >/dev/null
-          docker volume rm maef-spool maef-publisher-out >/dev/null
+          docker volume rm maef-spool maef-publisher-out maef-publisher-secret >/dev/null
           unset publisher_secret
 
       - name: Print sanitized separation summary
