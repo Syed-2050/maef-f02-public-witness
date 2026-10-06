@@ -38,6 +38,15 @@ jobs:
 
           docker pull python:3.13-alpine
           docker volume create maef-spool >/dev/null
+          docker volume create maef-publisher-out >/dev/null
+
+          # Host-controlled setup only: initialize ownership before measured containers run.
+          docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges:true \
+            --mount type=volume,src=maef-spool,dst=/init \
+            python:3.13-alpine sh -c 'chown 65532:65532 /init && chmod 0700 /init'
+          docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges:true \
+            --mount type=volume,src=maef-publisher-out,dst=/init \
+            python:3.13-alpine sh -c 'chown 65531:65531 /init && chmod 0700 /init'
 
           cat > worker.py <<'PY'
           import os,json,hashlib,pathlib
@@ -158,7 +167,11 @@ jobs:
 
           docker start -a "$publisher_cid" > evidence/publisher-stdout.txt 2> evidence/publisher-stderr.txt
           test "$(docker inspect -f '{{.State.ExitCode}}' "$publisher_cid")" = "0"
-          cp publisher-out/publisher-receipt.json evidence/publisher-receipt.json
+          docker run --rm \
+            --network none --cap-drop ALL --security-opt no-new-privileges:true \
+            --read-only --mount type=volume,src=maef-publisher-out,dst=/publisher-out,readonly \
+            --mount type=bind,src="$PWD/evidence",dst=/hostout \
+            python:3.13-alpine sh -c 'cp /publisher-out/publisher-receipt.json /hostout/publisher-receipt.json'
 
           if grep -aFq "$publisher_secret" evidence/*; then
             echo "raw synthetic publisher secret leaked into sanitized evidence" >&2
@@ -188,7 +201,7 @@ jobs:
           find evidence -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS
 
           docker rm "$worker_cid" "$publisher_cid" >/dev/null
-          docker volume rm maef-spool >/dev/null
+          docker volume rm maef-spool maef-publisher-out >/dev/null
           unset publisher_secret
 
       - name: Print sanitized separation summary
