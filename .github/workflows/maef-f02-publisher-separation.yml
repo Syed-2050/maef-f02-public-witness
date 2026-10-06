@@ -144,6 +144,20 @@ jobs:
           cp worker-out/manifest.json evidence/worker-manifest.json
           cp worker-out/patch.bin evidence/worker-patch.bin
 
+          # Seal the one-way handoff after the worker has exited.
+          # Content bytes are fixed by the hashes above; only ownership/mode changes.
+          docker run --rm --network none \
+            --mount type=volume,src=maef-spool,dst=/spool \
+            python:3.13-alpine sh -c 'test -f /spool/manifest.json && test -f /spool/patch.bin && chown 0:65531 /spool /spool/manifest.json /spool/patch.bin && chmod 0550 /spool && chmod 0440 /spool/manifest.json /spool/patch.bin'
+
+          # Independently verify sealing did not alter worker content.
+          docker run --rm --network none --read-only \
+            --user 65531:65531 \
+            --mount type=volume,src=maef-spool,dst=/spool,readonly \
+            python:3.13-alpine sh -c 'sha256sum /spool/manifest.json /spool/patch.bin' > evidence/sealed-spool-sha256.txt
+          grep -Fq "$manifest_sha  /spool/manifest.json" evidence/sealed-spool-sha256.txt
+          grep -Fq "$patch_sha  /spool/patch.bin" evidence/sealed-spool-sha256.txt
+
           if grep -aFq "$publisher_secret" evidence/worker-manifest.json evidence/worker-patch.bin evidence/worker-stdout.txt evidence/worker-stderr.txt; then
             echo "synthetic publisher secret crossed into worker evidence" >&2
             exit 1
