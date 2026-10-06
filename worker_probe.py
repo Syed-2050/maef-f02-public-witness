@@ -57,10 +57,13 @@ interfaces=sorted(p.name for p in pathlib.Path("/sys/class/net").iterdir())
 non_loopback=[x for x in interfaces if x!="lo"]
 with open("/proc/net/route",encoding="utf-8") as f:
     r4=f.read().splitlines()[1:]
-default_v4=any(len(x.split())>1 and x.split()[1]=="00000000" for x in r4)
+default_v4=any(len(x.split())>1 and x.split()[1]=="00000000" and x.split()[0]!="lo" for x in r4)
 with open("/proc/net/ipv6_route",encoding="utf-8") as f:
     r6=f.read().splitlines()
-default_v6=any(len(x.split())>1 and x.split()[0]=="0"*32 and x.split()[1]=="00" for x in r6)
+default_v6=any(
+    len(parts)>=10 and parts[0]=="0"*32 and parts[1]=="00" and parts[-1]!="lo"
+    for parts in (line.split() for line in r6)
+)
 
 sock=socket.socket(); sock.settimeout(1.5); blocked=False; net_error=""
 try:
