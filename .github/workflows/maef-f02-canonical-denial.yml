@@ -1,0 +1,94 @@
+name: MAEF F02 Canonical Expected Denial
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/maef-f02-canonical-denial.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maef-f02-canonical-denial
+  cancel-in-progress: false
+
+jobs:
+  canonical-denial:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Execute authorized expected-denied canonical sentinel PUT
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          target_repo="Syed-2050/MX-build-lab"
+          target_branch="main"
+          expected_pre_ref="096ed72b458834a05e50b2cf3b297945f0024083"
+          sentinel=".maef-f02-denied-probe/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.txt"
+          api="https://api.github.com/repos/${target_repo}"
+
+          printf '%s\n' "$expected_pre_ref" > evidence/expected-canonical-pre-ref.txt
+          printf '%s\n' "$sentinel" > evidence/sentinel-path.txt
+          printf '%s\n' "${GITHUB_SHA}" > evidence/witness-commit.txt
+
+          payload="$(jq -cn             --arg msg "MAEF F02 authorized expected-denied canonical sentinel ${GITHUB_RUN_ID}"             --arg content "$(printf '%s' "THIS_CANONICAL_WRITE_MUST_BE_DENIED_${GITHUB_RUN_ID}" | base64 -w0)"             --arg branch "$target_branch"             '{message:$msg,content:$content,branch:$branch}')"
+
+          set +e
+          http_status="$(curl --proto '=https' --tlsv1.2 -sS             -o evidence/canonical-denial-response.json             -w '%{http_code}'             -X PUT             -H "Accept: application/vnd.github+json"             -H "Authorization: Bearer $GH_TOKEN"             -H "X-GitHub-Api-Version: 2022-11-28"             "${api}/contents/${sentinel}"             -d "$payload")"
+          curl_rc=$?
+          set -e
+
+          printf '%s\n' "$http_status" > evidence/canonical-denial-http-status.txt
+          printf '%s\n' "$curl_rc" > evidence/canonical-denial-curl-exit.txt
+
+          jq -n             --arg schema "MAEF_F02_CANONICAL_EXPECTED_DENIAL_V1"             --arg identity "PUBLIC_WITNESS_GITHUB_ACTIONS_TOKEN_CONTENTS_READ_ONLY"             --arg targetRepo "$target_repo"             --arg targetBranch "$target_branch"             --arg sentinel "$sentinel"             --arg expectedPreRef "$expected_pre_ref"             --arg witnessRepo "${GITHUB_REPOSITORY}"             --arg witnessCommit "${GITHUB_SHA}"             --arg runId "${GITHUB_RUN_ID}"             --arg runAttempt "${GITHUB_RUN_ATTEMPT}"             --arg httpStatus "$http_status"             --arg curlExit "$curl_rc"             '{
+              schema:$schema,
+              identity:$identity,
+              target:{repository:$targetRepo,branch:$targetBranch,path:$sentinel,method:"PUT"},
+              authorization:"OWNER_EXPLICIT_F02_TEST_B",
+              expectedOutcome:"DENIED",
+              expectedCanonicalPreRef:$expectedPreRef,
+              externalPostRefVerificationRequired:true,
+              witness:{repository:$witnessRepo,commit:$witnessCommit,runId:$runId,runAttempt:$runAttempt},
+              httpStatus:($httpStatus|tonumber),
+              curlExit:($curlExit|tonumber),
+              requestWasMutationIntent:true,
+              writeSucceeded:(($httpStatus|tonumber)==200 or ($httpStatus|tonumber)==201),
+              denialObserved:(($httpStatus|tonumber)==403 or ($httpStatus|tonumber)==404)
+            }' > evidence/canonical-denial-summary.json
+
+          rm -f evidence/SHA256SUMS
+          find evidence -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS
+
+          if [ "$curl_rc" -ne 0 ]; then
+            echo "Transport error: denial result cannot be qualified." >&2
+            exit 1
+          fi
+          if [ "$http_status" = "200" ] || [ "$http_status" = "201" ]; then
+            echo "SECURITY FAILURE: canonical sentinel write unexpectedly succeeded. No cleanup performed." >&2
+            exit 1
+          fi
+          if [ "$http_status" != "403" ] && [ "$http_status" != "404" ]; then
+            echo "Unexpected response status $http_status; fail closed." >&2
+            exit 1
+          fi
+
+      - name: Print sanitized denial summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f evidence/canonical-denial-summary.json ]; then cat evidence/canonical-denial-summary.json; fi
+          if [ -f evidence/SHA256SUMS ]; then cat evidence/SHA256SUMS; fi
+
+      - name: Upload sanitized denial evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: maef-f02-canonical-expected-denial
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 7
