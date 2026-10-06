@@ -50,7 +50,7 @@ jobs:
             python:3.13-alpine sh -c 'chown 65531:65531 /init && chmod 0700 /init'
           printf '%s' "$publisher_secret" | docker run -i --rm --network none \
             --mount type=volume,src=maef-publisher-secret,dst=/secret \
-            python:3.13-alpine sh -c 'cat >/secret/value && chmod 0400 /secret/value'
+            python:3.13-alpine sh -c 'cat >/secret/value && chown 65531:65531 /secret/value && chmod 0400 /secret/value'
 
           cat > worker.py <<'PY'
           import os,json,hashlib,pathlib
