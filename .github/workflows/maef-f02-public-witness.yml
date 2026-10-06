@@ -1,0 +1,137 @@
+name: MAEF F02 Public Worker Witness
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maef-f02-public-witness
+  cancel-in-progress: false
+
+jobs:
+  witness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Prepare immutable public witness inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p buildctx evidence
+          base="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}"
+          curl --proto '=https' --tlsv1.2 -fsSLo buildctx/worker_probe.py "${base}/worker_probe.py"
+          curl --proto '=https' --tlsv1.2 -fsSLo buildctx/Dockerfile "${base}/Dockerfile"
+          sha256sum buildctx/worker_probe.py buildctx/Dockerfile | tee evidence/public-source-sha256.txt
+          printf '%s\n' "790e330cee287a4e31a36dfda496068f68db8dc8" > evidence/candidate-sha.txt
+          printf '%s\n' "9134cc9f0b78f058a419a058ecb92f4d2cc49919" > evidence/candidate-tree.txt
+          printf '%s\n' "${GITHUB_SHA}" > evidence/witness-repo-commit.txt
+
+      - name: Build isolated witness image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull python:3.13-alpine
+          docker image inspect python:3.13-alpine > evidence/base-image-inspect.json
+          docker build --network=none -t maef-f02-public-witness:${GITHUB_SHA} buildctx
+          docker image inspect maef-f02-public-witness:${GITHUB_SHA} > evidence/witness-image-inspect.json
+
+      - name: Execute measured credential-free worker
+        id: measured
+        shell: bash
+        run: |
+          set -euo pipefail
+          challenge="$(openssl rand -hex 32)"
+          decoy_raw="MAEF_PUBLIC_WITNESS_DECOY_$(openssl rand -hex 32)"
+          decoy_sha="$(printf '%s' "$decoy_raw" | sha256sum | awk '{print $1}')"
+          printf '%s\n' "$challenge" > evidence/challenge.txt
+          printf '%s\n' "$decoy_sha" > evidence/decoy-sha256.txt
+
+          cid="$(docker create             --name maef-f02-worker             --network none             --cap-drop ALL             --security-opt no-new-privileges:true             --user 65532:65532             --read-only             --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777             --tmpfs /home/maefworker:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=65532,gid=65532             --entrypoint /usr/bin/env             maef-f02-public-witness:${GITHUB_SHA}             -i             PATH=/usr/local/bin:/usr/bin:/bin             LANG=C.UTF-8             NODE_ENV=test             HOME=/home/maefworker             USER=maefworker             LOGNAME=maefworker             XDG_CONFIG_HOME=/home/maefworker/.config             XDG_CACHE_HOME=/home/maefworker/.cache             XDG_DATA_HOME=/home/maefworker/.local/share             TMPDIR=/tmp             SHELL=/bin/sh             /usr/local/bin/python3 /opt/witness/worker_probe.py "$challenge" "$decoy_sha")"
+
+          docker inspect "$cid" > evidence/container-inspect-pre.json
+
+          jq -e '
+            .[0].HostConfig.NetworkMode=="none" and
+            (.[0].HostConfig.CapDrop|index("ALL")!=null) and
+            (.[0].HostConfig.SecurityOpt|index("no-new-privileges:true")!=null) and
+            .[0].HostConfig.ReadonlyRootfs==true and
+            .[0].HostConfig.Privileged==false and
+            .[0].Config.User=="65532:65532" and
+            ((.[0].HostConfig.Binds // [])|length==0) and
+            ((.[0].Mounts // [])|length==0) and
+            (.[0].HostConfig.PidMode=="") and
+            ((.[0].HostConfig.Devices // [])|length==0)
+          ' evidence/container-inspect-pre.json >/dev/null
+
+          set +e
+          docker start -a "$cid" > evidence/worker-observation.json 2> evidence/worker-stderr.txt
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > evidence/worker-exit-code.txt
+          docker inspect "$cid" > evidence/container-inspect-post.json
+
+          test "$rc" -eq 0
+          jq -e --arg sha "790e330cee287a4e31a36dfda496068f68db8dc8"                 --arg tree "9134cc9f0b78f058a419a058ecb92f4d2cc49919"                 --arg challenge "$challenge"                 --arg decoy "$decoy_sha" '
+            .schema=="MAEF_F02_PUBLIC_WORKER_WITNESS_V1" and
+            .candidateBinding.candidateSha==$sha and
+            .candidateBinding.candidateTree==$tree and
+            .candidateBinding.privateSourceFetchedByWorker==false and
+            .challenge==$challenge and
+            .decoySha256==$decoy and
+            .selfCheck.pass==true and
+            (.selfCheck.failures|length==0) and
+            .checks.decoy.rawDecoyReceivedByWorker==false and
+            .checks.decoy.digestOnlyReceived==true
+          ' evidence/worker-observation.json >/dev/null
+
+          if grep -Fq "$decoy_raw" evidence/worker-observation.json; then
+            echo "raw host-only decoy leaked into worker evidence" >&2
+            exit 1
+          fi
+
+          jq -n             --arg candidateSha "790e330cee287a4e31a36dfda496068f68db8dc8"             --arg candidateTree "9134cc9f0b78f058a419a058ecb92f4d2cc49919"             --arg witnessCommit "${GITHUB_SHA}"             --arg challenge "$challenge"             --arg decoySha256 "$decoy_sha"             --arg imageId "$(docker image inspect --format '{{.Id}}' maef-f02-public-witness:${GITHUB_SHA})"             --arg capturedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)"             '{
+              schema:"MAEF_F02_PUBLIC_WITNESS_HOST_SUMMARY_V1",
+              candidateSha:$candidateSha,
+              candidateTree:$candidateTree,
+              witnessCommit:$witnessCommit,
+              challenge:$challenge,
+              decoySha256:$decoySha256,
+              imageId:$imageId,
+              capturedAt:$capturedAt,
+              workerIsolationObserved:true,
+              workerHadGitHubCredential:false,
+              workerHadRepositoryMount:false,
+              workerNetworkMode:"none",
+              liveWriteDenialProven:false,
+              publisherActivated:false,
+              cutoverExecuted:false,
+              f02OverallQualified:false
+            }' > evidence/host-summary.json
+
+          rm -f evidence/SHA256SUMS
+          find evidence -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS
+          docker rm "$cid" >/dev/null
+
+      - name: Print witness summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== MAEF F02 PUBLIC WITNESS SUMMARY ==="
+          if [ -f evidence/host-summary.json ]; then cat evidence/host-summary.json; fi
+          echo "=== WORKER SELF CHECK ==="
+          if [ -f evidence/worker-observation.json ]; then jq '.selfCheck' evidence/worker-observation.json || true; fi
+          echo "=== EVIDENCE HASHES ==="
+          if [ -f evidence/SHA256SUMS ]; then cat evidence/SHA256SUMS; fi
+
+      - name: Upload sanitized witness evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: maef-f02-public-worker-witness
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 7
